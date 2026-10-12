@@ -208,19 +208,32 @@ where
 							self.frontier_backend.as_ref(),
 							self.sync_from,
 							super::PERIODIC_RECONCILE_WINDOW,
+							self.state_pruning_blocks.is_none(),
 						) {
 							debug!(
 								target: "reconcile",
 								"Recent window reconcile failed: {e:?}",
 							);
 						}
-						if let Err(e) = super::repair_canonical_number_mappings_batch(
-							self.client.as_ref(),
-							self.storage_override.as_ref(),
-							self.frontier_backend.as_ref(),
-							self.sync_from,
-							super::CURSOR_REPAIR_IDLE_BATCH,
-						) {
+						let repair = if self.state_pruning_blocks.is_none() {
+							super::canonical_reconciler::reconcile_archive_from_cursor_batch(
+								self.client.as_ref(),
+								self.storage_override.as_ref(),
+								self.frontier_backend.as_ref(),
+								self.sync_from,
+								super::CURSOR_REPAIR_IDLE_BATCH,
+							)
+							.map(|_| ())
+						} else {
+							super::repair_canonical_number_mappings_batch(
+								self.client.as_ref(),
+								self.storage_override.as_ref(),
+								self.frontier_backend.as_ref(),
+								self.sync_from,
+								super::CURSOR_REPAIR_IDLE_BATCH,
+							)
+						};
+						if let Err(e) = repair {
 							debug!(
 								target: "reconcile",
 								"Cursor repair batch failed: {e:?}",

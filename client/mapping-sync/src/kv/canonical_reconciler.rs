@@ -56,6 +56,8 @@ pub struct ReconcileStats {
 enum CursorUpdateStrategy {
 	Replace,
 	KeepLower,
+	ArchiveWindow,
+	ArchiveHistory,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +107,7 @@ pub fn reconcile_reorg_window<Block: BlockT, C: HeaderBackend<Block>>(
 	reorg_info: Option<&ReorgInfo<Block>>,
 	new_best_hash: Block::Hash,
 	sync_from: <Block::Header as HeaderT>::Number,
+	archive: bool,
 ) -> Result<Option<ReconcileStats>, String> {
 	let Some(window) = build_reconcile_window(client, reorg_info, new_best_hash)? else {
 		return Ok(None);
@@ -114,6 +117,9 @@ pub fn reconcile_reorg_window<Block: BlockT, C: HeaderBackend<Block>>(
 	let best_number: u64 = client.info().best_number.unique_saturated_into();
 	let start = window.start.max(sync_from_number);
 	let end = window.end.max(sync_from_number);
+	if archive {
+		queue_archive_window(client, frontier_backend, sync_from_number, start, end)?;
+	}
 	let stats = reconcile_range_internal(
 		client,
 		storage_override,
@@ -123,8 +129,164 @@ pub fn reconcile_reorg_window<Block: BlockT, C: HeaderBackend<Block>>(
 		sync_from_number,
 		best_number,
 		ScanDirection::Ascending,
-		CursorUpdateStrategy::KeepLower,
+		if archive {
+			CursorUpdateStrategy::ArchiveWindow
+		} else {
+			CursorUpdateStrategy::KeepLower
+		},
 	)?;
+	Ok(Some(stats))
+}
+
+/// Persist import repair work before ordinary syncing can mark those blocks synced.
+pub fn queue_archive_imports<Block: BlockT, C: HeaderBackend<Block>>(
+	client: &C,
+	frontier_backend: &fc_db::kv::Backend<Block, C>,
+	sync_from: <Block::Header as HeaderT>::Number,
+	imports: &std::collections::HashMap<Block::Hash, super::worker::BestBlockInfo<Block>>,
+) -> Result<(), String> {
+	let sync_from = UniqueSaturatedInto::<u64>::unique_saturated_into(sync_from);
+	let mut window: Option<ReconcileWindow> = None;
+	for (hash, info) in imports {
+		let number = UniqueSaturatedInto::<u64>::unique_saturated_into(info.block_number);
+		if number < sync_from {
+			continue;
+		}
+		let candidate = if info.reorg_info.is_some() {
+			build_reconcile_window(client, info.reorg_info.as_deref(), *hash)?.ok_or_else(|| {
+				"Missing new-best header during archive reconciliation".to_string()
+			})?
+		} else {
+			ReconcileWindow {
+				start: number,
+				end: number,
+			}
+		};
+		window = Some(window.map_or(candidate, |old| ReconcileWindow {
+			start: old.start.min(candidate.start),
+			end: old.end.max(candidate.end),
+		}));
+	}
+	if let Some(window) = window {
+		queue_archive_window(
+			client,
+			frontier_backend,
+			sync_from,
+			window.start.max(sync_from),
+			window.end,
+		)?;
+	}
+	Ok(())
+}
+
+fn archive_progress<Block: BlockT, C: HeaderBackend<Block>>(
+	client: &C,
+	frontier_backend: &fc_db::kv::Backend<Block, C>,
+	sync_from: u64,
+) -> Result<fc_db::kv::ArchiveRepairProgress, String> {
+	let previous = frontier_backend.mapping().archive_repair_progress()?;
+	if let Some(progress) = previous.filter(|p| p.sync_from == sync_from) {
+		return Ok(progress);
+	}
+	// Finalized can lag far behind best during startup. Cover the already-known
+	// history, but wait for this fixed target to finalize before scanning it.
+	let target =
+		UniqueSaturatedInto::<u64>::unique_saturated_into(client.info().best_number).max(sync_from);
+	let progress = fc_db::kv::ArchiveRepairProgress {
+		sync_from,
+		target,
+		next_cursor: Some(target),
+		pending: previous
+			.and_then(|p| p.pending)
+			.and_then(|(start, end)| (end >= sync_from).then_some((start.max(sync_from), end))),
+	};
+	frontier_backend
+		.mapping()
+		.set_archive_repair_progress(progress)?;
+	Ok(progress)
+}
+
+fn queue_archive_window<Block: BlockT, C: HeaderBackend<Block>>(
+	client: &C,
+	frontier_backend: &fc_db::kv::Backend<Block, C>,
+	sync_from: u64,
+	start: u64,
+	end: u64,
+) -> Result<(), String> {
+	let mut progress = archive_progress(client, frontier_backend, sync_from)?;
+	let pending = progress
+		.pending
+		.map_or((start, end), |(from, to)| (from.min(start), to.max(end)));
+	if progress.pending != Some(pending) {
+		progress.pending = Some(pending);
+		frontier_backend
+			.mapping()
+			.set_archive_repair_progress(progress)?;
+	}
+	Ok(())
+}
+
+/// Finish one archive sweep, then only retry explicitly pending live windows.
+pub fn reconcile_archive_from_cursor_batch<Block: BlockT, C: HeaderBackend<Block>>(
+	client: &C,
+	storage_override: &dyn fc_storage::StorageOverride<Block>,
+	frontier_backend: &fc_db::kv::Backend<Block, C>,
+	sync_from: <Block::Header as HeaderT>::Number,
+	max_blocks: u64,
+) -> Result<Option<ReconcileStats>, String> {
+	if max_blocks == 0 {
+		return Ok(None);
+	}
+	let sync_from_number = UniqueSaturatedInto::<u64>::unique_saturated_into(sync_from);
+	let mut progress = archive_progress(client, frontier_backend, sync_from_number)?;
+	let (start, end, direction) = if let Some((from, to)) = progress.pending {
+		(
+			from,
+			from.saturating_add(max_blocks - 1).min(to),
+			ScanDirection::Ascending,
+		)
+	} else if let Some(cursor) = progress.next_cursor {
+		let finalized =
+			UniqueSaturatedInto::<u64>::unique_saturated_into(client.info().finalized_number);
+		if finalized < progress.target {
+			return Ok(None);
+		}
+		let start = cursor.max(sync_from_number).min(progress.target);
+		(
+			start,
+			start.saturating_sub(max_blocks - 1).max(sync_from_number),
+			ScanDirection::Descending,
+		)
+	} else {
+		return Ok(None);
+	};
+	let stats = reconcile_range_internal(
+		client,
+		storage_override,
+		frontier_backend,
+		start,
+		end,
+		sync_from_number,
+		progress.target,
+		direction,
+		CursorUpdateStrategy::ArchiveHistory,
+	)?;
+	if let Some((_, to)) = progress.pending {
+		progress.pending = stats
+			.first_unresolved
+			.map(|from| (from, to))
+			.or_else(|| (end < to).then_some((end.saturating_add(1), to)));
+	} else {
+		progress.next_cursor = stats
+			.first_unresolved
+			.or_else(|| (end > sync_from_number).then_some(end.saturating_sub(1)));
+	}
+	frontier_backend
+		.mapping()
+		.set_archive_repair_progress(progress)?;
+	if direction == ScanDirection::Descending && progress.next_cursor.is_none() {
+		log::info!(target: "reconcile", "Archive historical mapping repair complete through #{}", progress.target);
+	}
 	Ok(Some(stats))
 }
 
@@ -177,6 +339,7 @@ pub fn reconcile_recent_window<Block: BlockT, C: HeaderBackend<Block>>(
 	frontier_backend: &fc_db::kv::Backend<Block, C>,
 	sync_from: <Block::Header as HeaderT>::Number,
 	window_size: u64,
+	archive: bool,
 ) -> Result<Option<ReconcileStats>, String> {
 	if window_size == 0 {
 		return Ok(None);
@@ -195,6 +358,9 @@ pub fn reconcile_recent_window<Block: BlockT, C: HeaderBackend<Block>>(
 	if end < sync_from_number {
 		return Ok(None);
 	}
+	if archive {
+		queue_archive_window(client, frontier_backend, sync_from_number, start, end)?;
+	}
 
 	let stats = reconcile_range_internal(
 		client,
@@ -205,7 +371,11 @@ pub fn reconcile_recent_window<Block: BlockT, C: HeaderBackend<Block>>(
 		sync_from_number,
 		best_number,
 		ScanDirection::Ascending,
-		CursorUpdateStrategy::KeepLower,
+		if archive {
+			CursorUpdateStrategy::ArchiveWindow
+		} else {
+			CursorUpdateStrategy::KeepLower
+		},
 	)?;
 	Ok(Some(stats))
 }
@@ -332,6 +502,13 @@ fn reconcile_range_internal<Block: BlockT, C: HeaderBackend<Block>>(
 					Some(highest_reconciled.map_or(number, |current| current.max(number)));
 			}
 			None => {
+				if matches!(
+					cursor_update,
+					CursorUpdateStrategy::ArchiveWindow | CursorUpdateStrategy::ArchiveHistory
+				) {
+					// Digest-only repair cannot verify or restore transaction mappings.
+					first_unresolved.get_or_insert(number);
+				}
 				// State unavailable — re-derive the Ethereum block hash from the
 				// header digest (pruning-safe) instead of trusting BLOCK_NUMBER_MAPPING,
 				// which may be stale after a reorg.
@@ -432,6 +609,19 @@ fn reconcile_range_internal<Block: BlockT, C: HeaderBackend<Block>>(
 	}
 
 	validate_latest_pointer_invariant(client, storage_override, frontier_backend)?;
+	if cursor_update == CursorUpdateStrategy::ArchiveWindow && first_unresolved.is_none() {
+		if let Some(mut progress) = frontier_backend.mapping().archive_repair_progress()? {
+			if progress
+				.pending
+				.is_some_and(|(from, to)| from >= start && to <= end)
+			{
+				progress.pending = None;
+				frontier_backend
+					.mapping()
+					.set_archive_repair_progress(progress)?;
+			}
+		}
+	}
 
 	let lag_blocks = compute_lag_blocks(client, frontier_backend)?;
 	let stats = ReconcileStats {
@@ -466,6 +656,12 @@ fn update_repair_cursor<Block: BlockT, C: HeaderBackend<Block>>(
 	candidate_next: u64,
 	strategy: CursorUpdateStrategy,
 ) -> Result<(), String> {
+	if matches!(
+		strategy,
+		CursorUpdateStrategy::ArchiveWindow | CursorUpdateStrategy::ArchiveHistory
+	) {
+		return Ok(());
+	}
 	let candidate_next = candidate_next.max(sync_from_number);
 	let current = frontier_backend
 		.mapping()
@@ -475,6 +671,9 @@ fn update_repair_cursor<Block: BlockT, C: HeaderBackend<Block>>(
 		(CursorUpdateStrategy::Replace, _) => candidate_next,
 		(CursorUpdateStrategy::KeepLower, Some(current)) => current.min(candidate_next),
 		(CursorUpdateStrategy::KeepLower, None) => candidate_next,
+		(CursorUpdateStrategy::ArchiveWindow | CursorUpdateStrategy::ArchiveHistory, _) => {
+			unreachable!()
+		}
 	};
 
 	frontier_backend

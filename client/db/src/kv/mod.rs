@@ -81,6 +81,18 @@ pub mod static_keys {
 	pub const CURRENT_SYNCING_TIPS: &[u8] = b"CURRENT_SYNCING_TIPS";
 	pub const LATEST_CANONICAL_INDEXED_BLOCK: &[u8] = b"LATEST_CANONICAL_INDEXED_BLOCK";
 	pub const CANONICAL_NUMBER_REPAIR_CURSOR: &[u8] = b"CANONICAL_NUMBER_REPAIR_CURSOR";
+	pub const ARCHIVE_REPAIR_PROGRESS: &[u8] = b"ARCHIVE_REPAIR_PROGRESS_V1";
+}
+
+/// One-time archive backfill and any live repair window that still needs a retry.
+#[derive(Clone, Copy, Debug, Decode, Encode, Eq, PartialEq)]
+pub struct ArchiveRepairProgress {
+	pub sync_from: u64,
+	pub target: u64,
+	/// None means the initial, inclusive historical sweep has completed.
+	pub next_cursor: Option<u64>,
+	/// Inclusive ascending window, persisted before live reconciliation starts.
+	pub pending: Option<(u64, u64)>,
 }
 
 #[derive(Clone)]
@@ -620,6 +632,28 @@ impl<Block: BlockT> MappingDb<Block> {
 		self.db.commit(transaction).map_err(|e| e.to_string())
 	}
 
+	/// Returns the independent archive repair progress, or None before initialization.
+	pub fn archive_repair_progress(&self) -> Result<Option<ArchiveRepairProgress>, String> {
+		self.db
+			.get(columns::META, static_keys::ARCHIVE_REPAIR_PROGRESS)
+			.map(|raw| ArchiveRepairProgress::decode(&mut &raw[..]).map_err(|e| format!("{e:?}")))
+			.transpose()
+	}
+
+	/// Atomically persists archive progress without changing the legacy repair cursor.
+	pub fn set_archive_repair_progress(
+		&self,
+		progress: ArchiveRepairProgress,
+	) -> Result<(), String> {
+		let mut transaction = sp_database::Transaction::new();
+		transaction.set(
+			columns::META,
+			static_keys::ARCHIVE_REPAIR_PROGRESS,
+			&progress.encode(),
+		);
+		self.db.commit(transaction).map_err(|e| e.to_string())
+	}
+
 	/// Returns the canonical number-repair cursor, or None if not set.
 	pub fn canonical_number_repair_cursor(&self) -> Result<Option<u64>, String> {
 		match self
@@ -1060,6 +1094,50 @@ mod tests {
 			pointer,
 			Some(3),
 			"read-only: pointer must stay at 3, not be advanced to 6"
+		);
+	}
+
+	#[tokio::test]
+	async fn failed_archive_progress_commit_does_not_mark_sweep_complete() {
+		struct RejectCommit(Arc<dyn Database<DbHash>>);
+		impl Database<DbHash> for RejectCommit {
+			fn commit(
+				&self,
+				_: sp_database::Transaction<DbHash>,
+			) -> sp_database::error::Result<()> {
+				Err(sp_database::error::DatabaseError(Box::new(
+					std::io::Error::other("injected commit failure"),
+				)))
+			}
+			fn get(&self, col: sp_database::ColumnId, key: &[u8]) -> Option<Vec<u8>> {
+				self.0.get(col, key)
+			}
+		}
+		let env = TestEnv::new(0).await;
+		let pending = ArchiveRepairProgress {
+			sync_from: 0,
+			target: 0,
+			next_cursor: Some(0),
+			pending: None,
+		};
+		env.backend
+			.mapping()
+			.set_archive_repair_progress(pending)
+			.unwrap();
+		let failing = MappingDb::<OpaqueBlock> {
+			db: Arc::new(RejectCommit(env.backend.mapping().db.clone())),
+			write_lock: Arc::new(Mutex::new(())),
+			_marker: PhantomData,
+		};
+		assert!(failing
+			.set_archive_repair_progress(ArchiveRepairProgress {
+				next_cursor: None,
+				..pending
+			})
+			.is_err());
+		assert_eq!(
+			env.backend.mapping().archive_repair_progress().unwrap(),
+			Some(pending)
 		);
 	}
 }

@@ -532,6 +532,7 @@ where
 		frontier_backend,
 		sync_from,
 		PERIODIC_RECONCILE_WINDOW,
+		state_pruning_blocks.is_none(),
 	)?;
 
 	// Notify on import and remove closed channels using the unified notification mechanism.
@@ -553,6 +554,7 @@ where
 			reorg_info.as_deref(),
 			hash,
 			sync_from,
+			state_pruning_blocks.is_none(),
 		)?;
 		log::debug!(
 			target: "reconcile",
@@ -595,6 +597,14 @@ where
 	BE: Backend<Block>,
 {
 	let mut synced_any = false;
+	if state_pruning_blocks.is_none() {
+		canonical_reconciler::queue_archive_imports(
+			client,
+			frontier_backend,
+			sync_from,
+			best_at_import,
+		)?;
+	}
 
 	for _ in 0..limit {
 		synced_any = synced_any
@@ -796,8 +806,11 @@ mod tests {
 		ethereum::Block::new(partial_header, transactions, vec![])
 	}
 
+	#[derive(Default)]
 	struct SelectiveStorageOverride {
 		blocks: HashMap<<OpaqueBlock as BlockT>::Hash, ethereum::BlockV3>,
+		reads: std::sync::atomic::AtomicUsize,
+		fail_at: Option<H256>,
 	}
 
 	impl StorageOverride<OpaqueBlock> for SelectiveStorageOverride {
@@ -819,6 +832,9 @@ mod tests {
 		}
 
 		fn current_block(&self, at: <OpaqueBlock as BlockT>::Hash) -> Option<ethereum::BlockV3> {
+			assert_ne!(Some(at), self.fail_at, "simulated interrupted state read");
+			self.reads
+				.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 			self.blocks.get(&at).cloned()
 		}
 
@@ -923,6 +939,7 @@ mod tests {
 			None,
 			b1_hash,
 			1,
+			false,
 		)
 		.expect("repair pass");
 
@@ -1010,6 +1027,7 @@ mod tests {
 		let eth_hash_2 = eth_block_2.header.hash();
 		let storage_override = SelectiveStorageOverride {
 			blocks: HashMap::from([(canonical_hash_2, eth_block_2)]),
+			..Default::default()
 		};
 
 		repair_canonical_number_mappings_batch(
@@ -1125,6 +1143,7 @@ mod tests {
 				(canonical_hash_2, eth_block_2),
 				(canonical_hash_3, eth_block_3),
 			]),
+			..Default::default()
 		};
 
 		frontier_backend
@@ -1149,6 +1168,7 @@ mod tests {
 			Some(&reorg_info),
 			canonical_hash_3,
 			3,
+			false,
 		)
 		.expect("reconcile reorg window")
 		.expect("stats");
@@ -1217,6 +1237,7 @@ mod tests {
 		let canonical_eth_hash = canonical_eth_block.header.hash();
 		let storage_override = SelectiveStorageOverride {
 			blocks: HashMap::from([(canonical_hash, canonical_eth_block)]),
+			..Default::default()
 		};
 
 		frontier_backend
@@ -1333,6 +1354,7 @@ mod tests {
 				(canonical_hash_1, eth_block_1),
 				(canonical_hash_2, eth_block_2),
 			]),
+			..Default::default()
 		};
 
 		frontier_backend
@@ -1729,6 +1751,7 @@ mod tests {
 		let eth_hash = eth_block.header.hash();
 		let storage_override = SelectiveStorageOverride {
 			blocks: HashMap::from([(canonical_hash, eth_block)]),
+			..Default::default()
 		};
 
 		// Block is completely unsynced: no SYNCED, no BLOCK_MAPPING, no BLOCK_NUMBER_MAPPING.
@@ -1866,6 +1889,7 @@ mod tests {
 		// returns the ethereum block with transactions).
 		let storage_override = SelectiveStorageOverride {
 			blocks: HashMap::from([(canonical_hash, eth_block)]),
+			..Default::default()
 		};
 		let stats = canonical_reconciler::reconcile_from_cursor_batch(
 			client.as_ref(),
@@ -1896,5 +1920,594 @@ mod tests {
 			stats.updated, 1,
 			"reconciler must report 1 update for tx repair"
 		);
+	}
+
+	struct ArchiveTestEnv {
+		client: Arc<substrate_test_runtime_client::TestClient>,
+		backend: Option<fc_db::kv::Backend<OpaqueBlock, substrate_test_runtime_client::TestClient>>,
+		storage: SelectiveStorageOverride,
+		hashes: Vec<H256>,
+		tmp: tempfile::TempDir,
+	}
+
+	impl ArchiveTestEnv {
+		fn new(blocks: u64, finalized_through: u64) -> Self {
+			let (client, _) = TestClientBuilder::new()
+				.build_with_native_executor::<substrate_test_runtime_client::runtime::RuntimeApi, _>(
+				None,
+			);
+			let client = Arc::new(client);
+			let genesis = client.info().genesis_hash;
+			let mut env = Self {
+				client,
+				backend: None,
+				storage: SelectiveStorageOverride::default(),
+				hashes: vec![genesis],
+				tmp: tempdir().unwrap(),
+			};
+			env.storage.blocks.insert(genesis, make_ethereum_block(0));
+			env.reopen();
+			for n in 1..=blocks {
+				let parent = *env.hashes.last().unwrap();
+				let hash = env.import(parent, n, n <= finalized_through);
+				env.hashes.push(hash);
+			}
+			env
+		}
+
+		fn settings(&self) -> fc_db::kv::DatabaseSettings {
+			fc_db::kv::DatabaseSettings {
+				#[cfg(feature = "rocksdb")]
+				source: sc_client_db::DatabaseSource::RocksDb {
+					path: self.tmp.path().to_path_buf(),
+					cache_size: 0,
+				},
+				#[cfg(not(feature = "rocksdb"))]
+				source: sc_client_db::DatabaseSource::ParityDb {
+					path: self.tmp.path().to_path_buf(),
+				},
+			}
+		}
+
+		fn reopen(&mut self) {
+			drop(self.backend.take());
+			self.backend =
+				Some(fc_db::kv::Backend::new(self.client.clone(), &self.settings()).unwrap());
+		}
+
+		fn db(
+			&self,
+		) -> &fc_db::kv::Backend<OpaqueBlock, substrate_test_runtime_client::TestClient> {
+			self.backend.as_ref().unwrap()
+		}
+
+		fn import(&mut self, parent: H256, seed: u64, finalized: bool) -> H256 {
+			let number = self.client.number(parent).unwrap().unwrap() + 1;
+			let mut eth = make_ethereum_block_with_txs(seed, 2);
+			eth.header.number = U256::from(number);
+			let mut builder = BlockBuilderBuilder::new(self.client.as_ref())
+				.on_parent_block(parent)
+				.fetch_parent_block_number(self.client.as_ref())
+				.unwrap()
+				.build()
+				.unwrap();
+			builder
+				.push_deposit_log_digest_item(ethereum_digest_item_for(&eth))
+				.unwrap();
+			let block = builder.build().unwrap().block;
+			let hash = block.header.hash();
+			if finalized {
+				futures::executor::block_on(self.client.import_as_final(BlockOrigin::Own, block))
+					.unwrap();
+			} else {
+				futures::executor::block_on(self.client.import(BlockOrigin::Own, block)).unwrap();
+			}
+			self.storage.blocks.insert(hash, eth);
+			hash
+		}
+
+		fn batch(&self, from: u64, size: u64) -> Option<canonical_reconciler::ReconcileStats> {
+			canonical_reconciler::reconcile_archive_from_cursor_batch(
+				self.client.as_ref(),
+				&self.storage,
+				self.db(),
+				from,
+				size,
+			)
+			.unwrap()
+		}
+
+		fn finish(&self, from: u64) {
+			for _ in 0..100 {
+				if self.batch(from, 128).is_none() {
+					return;
+				}
+			}
+			panic!("archive repair did not finish");
+		}
+
+		fn assert_queries(&self, number: u64, hash: H256) {
+			use fc_rpc::frontier_backend_client::{load_hash, load_transactions};
+			let eth = self.storage.blocks.get(&hash).unwrap();
+			assert_eq!(
+				self.db().mapping().block_hash_by_number(number).unwrap(),
+				Some(eth.header.hash())
+			);
+			assert_eq!(
+				futures::executor::block_on(load_hash::<OpaqueBlock, _>(
+					self.client.as_ref(),
+					self.db(),
+					eth.header.hash(),
+				))
+				.unwrap(),
+				Some(hash)
+			);
+			for (index, tx) in eth.transactions.iter().enumerate() {
+				assert_eq!(
+					futures::executor::block_on(load_transactions::<OpaqueBlock, _>(
+						self.client.as_ref(),
+						self.db(),
+						tx.hash(),
+						true,
+					))
+					.unwrap(),
+					Some((eth.header.hash(), index as u32))
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn archive_sweep_resumes_and_stays_complete_across_database_reopen() {
+		let mut env = ArchiveTestEnv::new(6, 6);
+		// A legacy shared cursor at the lower bound is not proof of a completed sweep.
+		env.db()
+			.mapping()
+			.set_canonical_number_repair_cursor(1)
+			.unwrap();
+		let first = env.batch(1, 2).unwrap();
+		assert_eq!((first.window.start, first.window.end), (6, 5));
+		canonical_reconciler::reconcile_recent_window(
+			env.client.as_ref(),
+			&env.storage,
+			env.db(),
+			1,
+			16,
+			true,
+		)
+		.unwrap();
+		canonical_reconciler::reconcile_reorg_window(
+			env.client.as_ref(),
+			&env.storage,
+			env.db(),
+			None,
+			env.hashes[6],
+			1,
+			true,
+		)
+		.unwrap();
+		assert_eq!(
+			env.db()
+				.mapping()
+				.archive_repair_progress()
+				.unwrap()
+				.unwrap()
+				.next_cursor,
+			Some(4)
+		);
+		env.reopen();
+		assert_eq!(env.batch(1, 2).unwrap().window.start, 4);
+		env.finish(1);
+		for n in 1..=6 {
+			env.assert_queries(n, env.hashes[n as usize]);
+		}
+		let reads = env.storage.reads.load(std::sync::atomic::Ordering::Relaxed);
+		env.reopen();
+		for _ in 0..3 {
+			assert!(env.batch(1, 128).is_none());
+		}
+		assert_eq!(
+			env.storage.reads.load(std::sync::atomic::Ordering::Relaxed),
+			reads
+		);
+		assert_eq!(
+			env.db().mapping().canonical_number_repair_cursor().unwrap(),
+			Some(1)
+		);
+	}
+
+	#[test]
+	fn archive_lower_bound_waits_for_full_state_and_repairs_transactions() {
+		let env = ArchiveTestEnv::new(1, 1);
+		let missing = canonical_reconciler::reconcile_archive_from_cursor_batch(
+			env.client.as_ref(),
+			&NoopStorageOverride,
+			env.db(),
+			1,
+			128,
+		)
+		.unwrap()
+		.unwrap();
+		assert_eq!(missing.first_unresolved, Some(1));
+		assert_eq!(
+			env.db()
+				.mapping()
+				.archive_repair_progress()
+				.unwrap()
+				.unwrap()
+				.next_cursor,
+			Some(1)
+		);
+		// Digest-only BLOCK_MAPPING exists, but no transactions have been recovered yet.
+		assert!(env
+			.db()
+			.mapping()
+			.transaction_metadata(&env.storage.blocks[&env.hashes[1]].transactions[0].hash())
+			.unwrap()
+			.is_empty());
+		env.finish(1);
+		env.assert_queries(1, env.hashes[1]);
+		assert!(env.batch(1, 128).is_none());
+	}
+
+	#[test]
+	fn archive_genesis_and_changed_activation_bound_are_not_skipped() {
+		let env = ArchiveTestEnv::new(3, 3);
+		env.finish(3);
+		assert_eq!(env.db().mapping().block_hash_by_number(2).unwrap(), None);
+		// A changed lower bound invalidates completion and includes the genesis block.
+		env.finish(0);
+		for n in 0..=3 {
+			env.assert_queries(n, env.hashes[n as usize]);
+		}
+		let progress = env
+			.db()
+			.mapping()
+			.archive_repair_progress()
+			.unwrap()
+			.unwrap();
+		assert_eq!(
+			(progress.sync_from, progress.target, progress.next_cursor),
+			(0, 3, None)
+		);
+	}
+
+	#[test]
+	fn archive_completion_keeps_new_block_latest_and_transaction_queries_working() {
+		let mut env = ArchiveTestEnv::new(2, 2);
+		env.finish(1);
+		let new_best = env.import(env.hashes[2], 3, true);
+		canonical_reconciler::reconcile_recent_window(
+			env.client.as_ref(),
+			&env.storage,
+			env.db(),
+			1,
+			16,
+			true,
+		)
+		.unwrap();
+		env.assert_queries(3, new_best);
+		assert_eq!(
+			futures::executor::block_on(fc_rpc::frontier_backend_client::native_block_id::<
+				OpaqueBlock,
+				_,
+			>(env.client.as_ref(), env.db(), None,))
+			.unwrap(),
+			Some(sp_runtime::generic::BlockId::Hash(new_best))
+		);
+		let progress = env
+			.db()
+			.mapping()
+			.archive_repair_progress()
+			.unwrap()
+			.unwrap();
+		assert_eq!(
+			(progress.target, progress.next_cursor, progress.pending),
+			(2, None, None)
+		);
+		assert!(env.batch(1, 128).is_none());
+	}
+
+	#[test]
+	fn archive_completed_sweep_preserves_deep_reorg_retry_after_reopen() {
+		use fc_rpc::frontier_backend_client::{load_hash, load_transactions};
+		let mut env = ArchiveTestEnv::new(1, 1);
+		env.finish(1);
+		for n in 2..=22 {
+			let hash = env.import(*env.hashes.last().unwrap(), n, false);
+			env.hashes.push(hash);
+		}
+		// Model fully indexed unfinalized blocks on the previous canonical fork.
+		for n in 2..=22 {
+			let hash = env.hashes[n as usize];
+			let eth = &env.storage.blocks[&hash];
+			env.db()
+				.mapping()
+				.write_hashes(
+					fc_db::kv::MappingCommitment::<OpaqueBlock> {
+						block_hash: hash,
+						ethereum_block_hash: eth.header.hash(),
+						ethereum_transaction_hashes: eth
+							.transactions
+							.iter()
+							.map(|tx| tx.hash())
+							.collect(),
+					},
+					n,
+					fc_db::kv::NumberMappingWrite::Write,
+				)
+				.unwrap();
+		}
+		env.db()
+			.mapping()
+			.set_latest_canonical_indexed_block(22)
+			.unwrap();
+		let old_hash = env.hashes[2];
+		let old_eth = env.storage.blocks[&old_hash].clone();
+		let mut fork = Vec::new();
+		let mut parent = env.hashes[1];
+		for n in 2..=23 {
+			parent = env.import(parent, 100 + n, false);
+			fork.push(parent);
+		}
+		assert_eq!(env.client.info().best_hash, parent);
+		let missing_state = env.storage.blocks.remove(&fork[0]).unwrap();
+		let reorg = ReorgInfo::<OpaqueBlock> {
+			common_ancestor: env.hashes[1],
+			new_best: parent,
+			enacted: fork.clone(),
+			retracted: env.hashes[2..].to_vec(),
+		};
+		let stats = canonical_reconciler::reconcile_reorg_window(
+			env.client.as_ref(),
+			&env.storage,
+			env.db(),
+			Some(&reorg),
+			parent,
+			1,
+			true,
+		)
+		.unwrap()
+		.unwrap();
+		assert_eq!(
+			(stats.window.start, stats.window.end, stats.first_unresolved),
+			(2, 23, Some(2))
+		);
+		env.reopen();
+		let progress = env
+			.db()
+			.mapping()
+			.archive_repair_progress()
+			.unwrap()
+			.unwrap();
+		assert_eq!(
+			(progress.next_cursor, progress.pending),
+			(None, Some((2, 23)))
+		);
+		env.storage.blocks.insert(fork[0], missing_state);
+		assert_eq!(
+			env.batch(1, 2).unwrap().window,
+			canonical_reconciler::ReconcileWindow { start: 2, end: 3 }
+		);
+		env.finish(1);
+		for (i, hash) in fork.iter().enumerate() {
+			env.assert_queries(i as u64 + 2, *hash);
+		}
+		assert_eq!(
+			futures::executor::block_on(load_hash::<OpaqueBlock, _>(
+				env.client.as_ref(),
+				env.db(),
+				old_eth.header.hash()
+			))
+			.unwrap(),
+			None
+		);
+		assert_eq!(
+			futures::executor::block_on(load_transactions::<OpaqueBlock, _>(
+				env.client.as_ref(),
+				env.db(),
+				old_eth.transactions[0].hash(),
+				true
+			))
+			.unwrap(),
+			None
+		);
+		assert_eq!(
+			futures::executor::block_on(fc_rpc::frontier_backend_client::native_block_id::<
+				OpaqueBlock,
+				_,
+			>(env.client.as_ref(), env.db(), None))
+			.unwrap(),
+			Some(sp_runtime::generic::BlockId::Hash(parent))
+		);
+		assert!(env.batch(1, 128).is_none());
+	}
+
+	#[test]
+	fn archive_sweep_repairs_partially_written_transaction_mappings() {
+		let env = ArchiveTestEnv::new(1, 1);
+		let hash = env.hashes[1];
+		let eth = &env.storage.blocks[&hash];
+		env.db()
+			.mapping()
+			.write_hashes(
+				fc_db::kv::MappingCommitment::<OpaqueBlock> {
+					block_hash: hash,
+					ethereum_block_hash: eth.header.hash(),
+					ethereum_transaction_hashes: vec![eth.transactions[0].hash()],
+				},
+				1,
+				fc_db::kv::NumberMappingWrite::Write,
+			)
+			.unwrap();
+		assert!(env
+			.db()
+			.mapping()
+			.transaction_metadata(&eth.transactions[1].hash())
+			.unwrap()
+			.is_empty());
+		env.finish(1);
+		env.assert_queries(1, hash);
+		assert!(env.batch(1, 128).is_none());
+	}
+
+	#[test]
+	fn archive_live_window_survives_interruption_after_sweep_completion() {
+		let mut env = ArchiveTestEnv::new(1, 1);
+		env.finish(1);
+		env.storage.fail_at = Some(env.hashes[1]);
+		let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			canonical_reconciler::reconcile_recent_window(
+				env.client.as_ref(),
+				&env.storage,
+				env.db(),
+				1,
+				16,
+				true,
+			)
+			.unwrap();
+		}));
+		assert!(interrupted.is_err());
+		env.reopen();
+		let progress = env
+			.db()
+			.mapping()
+			.archive_repair_progress()
+			.unwrap()
+			.unwrap();
+		assert_eq!(
+			(progress.next_cursor, progress.pending),
+			(None, Some((1, 1)))
+		);
+		env.storage.fail_at = None;
+		env.finish(1);
+		env.assert_queries(1, env.hashes[1]);
+		assert!(env.batch(1, 128).is_none());
+	}
+
+	#[test]
+	fn pruned_reconciliation_keeps_legacy_sweep_and_digest_fallback() {
+		let env = ArchiveTestEnv::new(1, 1);
+		env.finish(1);
+		let completed = env.db().mapping().archive_repair_progress().unwrap();
+		for _ in 0..2 {
+			let stats = canonical_reconciler::reconcile_from_cursor_batch(
+				env.client.as_ref(),
+				&NoopStorageOverride,
+				env.db(),
+				1,
+				128,
+			)
+			.unwrap()
+			.unwrap();
+			assert_eq!(stats.first_unresolved, None);
+			assert_eq!(
+				stats.window,
+				canonical_reconciler::ReconcileWindow { start: 1, end: 1 }
+			);
+		}
+		let recent = canonical_reconciler::reconcile_recent_window(
+			env.client.as_ref(),
+			&NoopStorageOverride,
+			env.db(),
+			1,
+			16,
+			false,
+		)
+		.unwrap()
+		.unwrap();
+		assert_eq!(recent.first_unresolved, None);
+		assert_eq!(
+			env.db().mapping().archive_repair_progress().unwrap(),
+			completed
+		);
+		env.assert_queries(1, env.hashes[1]);
+	}
+
+	#[test]
+	fn archive_startup_finalization_lag_does_not_skip_known_history() {
+		let mut env = ArchiveTestEnv::new(3, 0);
+		assert_eq!(env.client.info().finalized_number, 0);
+		assert!(env.batch(1, 128).is_none());
+		let waiting = env
+			.db()
+			.mapping()
+			.archive_repair_progress()
+			.unwrap()
+			.unwrap();
+		assert_eq!((waiting.target, waiting.next_cursor), (3, Some(3)));
+		assert_eq!(
+			env.storage.reads.load(std::sync::atomic::Ordering::Relaxed),
+			0
+		);
+		let new_best = env.import(env.hashes[3], 4, true);
+		env.finish(1);
+		for n in 1..=3 {
+			env.assert_queries(n, env.hashes[n as usize]);
+		}
+		canonical_reconciler::reconcile_recent_window(
+			env.client.as_ref(),
+			&env.storage,
+			env.db(),
+			1,
+			16,
+			true,
+		)
+		.unwrap();
+		env.assert_queries(4, new_best);
+		assert_eq!(
+			env.db()
+				.mapping()
+				.archive_repair_progress()
+				.unwrap()
+				.unwrap()
+				.target,
+			3
+		);
+		assert!(env.batch(1, 128).is_none());
+	}
+
+	#[test]
+	fn archive_import_repair_is_durable_before_block_is_marked_synced() {
+		let mut env = ArchiveTestEnv::new(1, 1);
+		env.finish(1);
+		let new_best = env.import(env.hashes[1], 2, true);
+		let imports = HashMap::from([(
+			new_best,
+			super::worker::BestBlockInfo::<OpaqueBlock> {
+				block_number: 2,
+				reorg_info: None,
+			},
+		)]);
+		canonical_reconciler::queue_archive_imports(env.client.as_ref(), env.db(), 1, &imports)
+			.unwrap();
+		let eth = &env.storage.blocks[&new_best];
+		// Simulate interruption after ordinary sync committed a digest-only mapping.
+		env.db()
+			.mapping()
+			.write_hashes(
+				fc_db::kv::MappingCommitment::<OpaqueBlock> {
+					block_hash: new_best,
+					ethereum_block_hash: eth.header.hash(),
+					ethereum_transaction_hashes: vec![],
+				},
+				2,
+				fc_db::kv::NumberMappingWrite::Write,
+			)
+			.unwrap();
+		assert!(env.db().mapping().is_synced(&new_best).unwrap());
+		env.reopen();
+		assert_eq!(
+			env.db()
+				.mapping()
+				.archive_repair_progress()
+				.unwrap()
+				.unwrap()
+				.pending,
+			Some((2, 2))
+		);
+		env.finish(1);
+		env.assert_queries(2, new_best);
+		assert!(env.batch(1, 128).is_none());
 	}
 }

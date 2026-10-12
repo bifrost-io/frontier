@@ -3136,6 +3136,7 @@ dependencies = [
  "ethereum",
  "ethereum-types",
  "fc-db",
+ "fc-rpc",
  "fc-storage",
  "fp-consensus",
  "fp-rpc",
