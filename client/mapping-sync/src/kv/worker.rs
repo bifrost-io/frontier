@@ -208,14 +208,20 @@ where
 							self.frontier_backend.as_ref(),
 							self.sync_from,
 							super::PERIODIC_RECONCILE_WINDOW,
-							self.state_pruning_blocks.is_none(),
+							super::archive_repair_enabled(
+								self.substrate_backend.as_ref(),
+								self.state_pruning_blocks,
+							),
 						) {
 							debug!(
 								target: "reconcile",
 								"Recent window reconcile failed: {e:?}",
 							);
 						}
-						let repair = if self.state_pruning_blocks.is_none() {
+						let repair = if super::archive_repair_enabled(
+							self.substrate_backend.as_ref(),
+							self.state_pruning_blocks,
+						) {
 							super::canonical_reconciler::reconcile_archive_from_cursor_batch(
 								self.client.as_ref(),
 								self.storage_override.as_ref(),

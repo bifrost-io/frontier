@@ -57,6 +57,14 @@ pub const PERIODIC_RECONCILE_WINDOW: u64 = 16;
 /// Keeps per-tick cost bounded while ensuring eventual consistency across the entire chain.
 pub const CURSOR_REPAIR_IDLE_BATCH: u64 = 128;
 
+fn archive_repair_enabled<Block: BlockT, BE: Backend<Block>>(
+	backend: &BE,
+	state_pruning_blocks: Option<u64>,
+) -> bool {
+	// An omitted CLI pruning option can still mean a constrained database.
+	state_pruning_blocks.is_none() && backend.requires_full_sync()
+}
+
 /// Sync a single block's Ethereum mapping from its consensus digest into the Frontier DB.
 pub fn sync_block<Block: BlockT, C: HeaderBackend<Block>>(
 	client: &C,
@@ -532,7 +540,7 @@ where
 		frontier_backend,
 		sync_from,
 		PERIODIC_RECONCILE_WINDOW,
-		state_pruning_blocks.is_none(),
+		archive_repair_enabled(substrate_backend, state_pruning_blocks),
 	)?;
 
 	// Notify on import and remove closed channels using the unified notification mechanism.
@@ -554,7 +562,7 @@ where
 			reorg_info.as_deref(),
 			hash,
 			sync_from,
-			state_pruning_blocks.is_none(),
+			archive_repair_enabled(substrate_backend, state_pruning_blocks),
 		)?;
 		log::debug!(
 			target: "reconcile",
@@ -597,7 +605,7 @@ where
 	BE: Backend<Block>,
 {
 	let mut synced_any = false;
-	if state_pruning_blocks.is_none() {
+	if archive_repair_enabled(substrate_backend, state_pruning_blocks) {
 		canonical_reconciler::queue_archive_imports(
 			client,
 			frontier_backend,
@@ -2509,5 +2517,20 @@ mod tests {
 		env.finish(1);
 		env.assert_queries(2, new_best);
 		assert!(env.batch(1, 128).is_none());
+	}
+
+	#[test]
+	fn omitted_pruning_option_does_not_enable_archive_repair_on_constrained_backend() {
+		let backend = sc_client_db::Backend::<OpaqueBlock>::new_test(256, 10);
+		assert!(!super::archive_repair_enabled(&backend, None));
+		assert!(!super::archive_repair_enabled(&backend, Some(256)));
+		for mode in [
+			sc_client_db::BlocksPruning::KeepAll,
+			sc_client_db::BlocksPruning::KeepFinalized,
+		] {
+			let archive = sc_client_db::Backend::<OpaqueBlock>::new_test_with_tx_storage(mode, 10);
+			assert!(super::archive_repair_enabled(&archive, None));
+			assert!(!super::archive_repair_enabled(&archive, Some(256)));
+		}
 	}
 }
